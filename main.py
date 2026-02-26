@@ -86,10 +86,50 @@ def sse(obj: dict) -> str:
 # MCP endpoints expected by Pega Connect MCP
 # Base URL to configure in Pega: http(s)://HOST:PORT/mcp
 # -----------------------------
-@app.get("/mcp/tools")
+@app.get("/mcp")
 def list_tools():
-    logger.info("GET /mcp/tools")
-    return {"tools": [{"name": name} for name in TOOLS.keys()]}
+    return {
+        "name": "Pega2Gemini MCP",
+        "version": "1.0",
+        "description": "Loan AI MCP Server powered by Gemini",
+        "tools": [
+            {
+                "name": "eligibility_check",
+                "description": "Check applicant loan eligibility",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "income": {"type": "number"},
+                        "creditScore": {"type": "number"}
+                    },
+                    "required": ["income", "creditScore"]
+                }
+            },
+            {
+                "name": "loan_recommendation",
+                "description": "Recommend loan products",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "income": {"type": "number"},
+                        "creditScore": {"type": "number"}
+                    },
+                    "required": ["income", "creditScore"]
+                }
+            },
+            {
+                "name": "credit_summary",
+                "description": "Summarize credit profile",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "creditScore": {"type": "number"}
+                    },
+                    "required": ["creditScore"]
+                }
+            }
+        ]
+    }
 
 @app.post("/mcp/invoke")
 async def invoke(request: Request):
