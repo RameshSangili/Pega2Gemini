@@ -139,9 +139,10 @@ async def build_response(message: dict):
 
     if method == "initialize":
         return {
-            "jsonrpc": "2.0", "id": msg_id,
+            "jsonrpc": "2.0", 
+            "id": msg_id,
             "result": {
-                "protocolVersion": "2024-11-05", # Updated to recent MCP spec
+                "protocolVersion": "2025-03-26", # FIXED: Matches Pega requirement
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "Pega2Gemini", "version": "1.0.0"},
             }
