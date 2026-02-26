@@ -1,7 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-import json
 import asyncio
+import json
 
 app = FastAPI()
 
@@ -12,26 +12,38 @@ TOOLS = [
 ]
 
 @app.get("/mcp/")
-async def mcp_stream():
+async def mcp_stream(request: Request):
 
     async def event_generator():
-        # 1️⃣ INIT event (required for Pega)
-        yield "event: init\n"
-        yield f"data: {json.dumps({'name':'Pega2Gemini MCP','version':'1.0'})}\n\n"
 
-        await asyncio.sleep(0.1)
-
-        # 2️⃣ TOOLS event
-        yield "event: tools\n"
-        yield f"data: {json.dumps({'tools': TOOLS})}\n\n"
-
-        # 3️⃣ Keep connection alive
+        # Wait for client initialize request
         while True:
-            await asyncio.sleep(15)
-            yield "event: keepalive\n"
-            yield "data: ping\n\n"
+            await asyncio.sleep(0.1)
+
+            if await request.is_disconnected():
+                break
+
+            # Proper MCP initialize response
+            response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "name": "Pega2Gemini",
+                    "version": "1.0",
+                    "tools": TOOLS
+                }
+            }
+
+            yield f"data: {json.dumps(response)}\n\n"
+
+            await asyncio.sleep(20)
 
     return StreamingResponse(
         event_generator(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
     )
+
