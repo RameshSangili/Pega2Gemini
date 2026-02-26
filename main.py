@@ -10,6 +10,7 @@ import uuid
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ---------------------------------------------------------------------------
 # Logging – verbose, timestamped, goes straight to Render's log stream
@@ -22,6 +23,35 @@ logging.basicConfig(
 log = logging.getLogger("pega2gemini")
 
 app = FastAPI(title="Pega2Gemini", version="0.1.0")
+
+# ---------------------------------------------------------------------------
+# Pure ASGI Diagnostic Middleware (SSE Compatible)
+# ---------------------------------------------------------------------------
+class DiagnosticMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        req_id = str(uuid.uuid4())[:8]
+        t0 = time.perf_counter()
+        
+        # Log basic request info
+        log.info("==> REQ [%s] %s %s", req_id, scope["method"], scope["path"])
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                elapsed = (time.perf_counter() - t0) * 1000
+                log.info("<== RES [%s] status=%s elapsed=%.1fms", 
+                         req_id, message["status"], elapsed)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+app.add_middleware(DiagnosticMiddleware)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -85,7 +115,6 @@ TOOLS: list = [
 # ---------------------------------------------------------------------------
 _sessions: dict = {}
 
-
 # ---------------------------------------------------------------------------
 # Gemini
 # ---------------------------------------------------------------------------
@@ -110,7 +139,6 @@ async def call_gemini(prompt: str) -> str:
     except Exception as exc:
         log.error("Gemini call failed after %.2fs: %s", time.time() - t0, exc)
         return f"Gemini call failed: {exc}"
-
 
 # ---------------------------------------------------------------------------
 # Tool dispatcher
@@ -139,7 +167,6 @@ async def dispatch_tool(tool_name: str, arguments: dict) -> str:
         return f"Unknown tool: {tool_name}"
     return await call_gemini(prompt)
 
-
 # ---------------------------------------------------------------------------
 # MCP JSON-RPC builder
 # ---------------------------------------------------------------------------
@@ -149,7 +176,7 @@ async def build_response(message: dict):
     log.info(">>> MCP request method=%s id=%s", method, msg_id)
 
     if method == "initialize":
-        resp = {
+        return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
@@ -158,23 +185,14 @@ async def build_response(message: dict):
                 "serverInfo": {"name": "Pega2Gemini", "version": "1"},
             },
         }
-        log.info("<<< Sending initialize response: %s", json.dumps(resp))
-        return resp
-
-    if method == "notifications/initialized":
-        log.info("<<< notifications/initialized received (no response)")
-        return None
 
     if method == "tools/list":
-        resp = {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
-        log.info("<<< Sending tools/list with %d tools", len(TOOLS))
-        return resp
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
 
     if method == "tools/call":
         params = message.get("params", {})
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
-        log.info("<<< tools/call tool=%s", tool_name)
         result_text = await dispatch_tool(tool_name, arguments)
         return {
             "jsonrpc": "2.0",
@@ -183,194 +201,47 @@ async def build_response(message: dict):
         }
 
     if method == "ping":
-        log.info("<<< pong")
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-    log.warning("Unknown method=%s id=%s", method, msg_id)
-    if msg_id is not None:
-        return {"jsonrpc": "2.0", "id": msg_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"}}
     return None
 
-
 # ---------------------------------------------------------------------------
-# DIAGNOSTIC MIDDLEWARE – logs every request/response with full headers+body
-# ---------------------------------------------------------------------------
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    req_id = str(uuid.uuid4())[:8]
-    t0 = time.time()
-
-    # Log request
-    body_bytes = await request.body()
-    body_str = body_bytes.decode("utf-8", errors="replace")[:2000]
-
-    log.info(
-        "==> REQ [%s] %s %s | headers=%s | body=%s",
-        req_id,
-        request.method,
-        request.url,
-        dict(request.headers),
-        body_str if body_str else "<empty>",
-    )
-
-    # Reconstruct request body so downstream can re-read it
-    async def receive():
-        return {"type": "http.request", "body": body_bytes}
-
-    request._receive = receive
-
-    response = await call_next(request)
-    elapsed = (time.time() - t0) * 1000
-
-    log.info(
-        "<== RES [%s] status=%d elapsed=%.1fms",
-        req_id,
-        response.status_code,
-        elapsed,
-    )
-    return response
-
-
-# ---------------------------------------------------------------------------
-# GET /mcp/ – SSE stream
+# MCP Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/mcp/")
 async def mcp_sse(request: Request):
     session_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = asyncio.Queue()
     _sessions[session_id] = queue
-    client_host = request.client.host if request.client else "unknown"
-
-    log.info(
-        "SSE CONNECT session=%s client=%s | total_sessions=%d",
-        session_id, client_host, len(_sessions),
-    )
 
     async def event_generator():
         try:
-            t_connect = time.time()
-
-            # 1. Send endpoint event
-            endpoint_event = f"event: endpoint\ndata: /mcp/messages/?session_id={session_id}\n\n"
-            log.info("SSE [%s] sending endpoint event -> /mcp/messages/?session_id=%s", session_id, session_id)
-            yield endpoint_event
-
-            # 2. Immediately send initialize result
-            init_resp = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "protocolVersion": "20250326",
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "Pega2Gemini", "version": "1"},
-                },
-            }
-            log.info("SSE [%s] sending proactive initialize result", session_id)
-            yield f"data: {json.dumps(init_resp)}\n\n"
-
-            # 3. Immediately send tools/list result
-            tools_resp = {"jsonrpc": "2.0", "id": 2, "result": {"tools": TOOLS}}
-            log.info("SSE [%s] sending proactive tools/list (%d tools)", session_id, len(TOOLS))
-            yield f"data: {json.dumps(tools_resp)}\n\n"
-
-            log.info("SSE [%s] handshake complete in %.1fms – waiting for tool calls",
-                     session_id, (time.time() - t_connect) * 1000)
-
-            # 4. Keep alive, drain tool-call responses
-            last_ping = time.time()
-            while not await request.is_disconnected():
+            log.info("SSE CONNECT session=%s", session_id)
+            # Initial endpoint event per MCP spec
+            yield f"event: endpoint\ndata: /mcp/messages/?session_id={session_id}\n\n"
+            
+            while True:
+                if await request.is_disconnected():
+                    break
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    log.info("SSE [%s] pushing response to stream: %s", session_id, json.dumps(msg)[:300])
-                    yield f"data: {json.dumps(msg)}\n\n"
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield f"event: message\ndata: {json.dumps(msg)}\n\n"
                 except asyncio.TimeoutError:
-                    now = time.time()
-                    log.debug("SSE [%s] keep-alive (connected %.0fs)", session_id, now - t_connect)
-                    last_ping = now
-                    yield ": keep-alive\n\n"
-
-        except Exception as exc:
-            log.error("SSE [%s] stream error: %s", session_id, exc, exc_info=True)
+                    yield ": ping\n\n"
         finally:
+            log.info("SSE DISCONNECTED session=%s", session_id)
             _sessions.pop(session_id, None)
-            log.info("SSE [%s] DISCONNECTED | remaining_sessions=%d", session_id, len(_sessions))
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-
-# ---------------------------------------------------------------------------
-# POST /mcp/messages/ – synchronous JSON-RPC handler
-# ---------------------------------------------------------------------------
 @app.post("/mcp/messages/")
-async def mcp_messages(request: Request, session_id: str = ""):
-    t0 = time.time()
-    client_host = request.client.host if request.client else "unknown"
-    log.info("POST /mcp/messages/ session=%s client=%s", session_id, client_host)
-
-    try:
-        body = await request.json()
-    except Exception as exc:
-        log.error("POST parse error: %s", exc)
-        return JSONResponse(
-            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
-            status_code=400,
-        )
-
-    log.info("POST body: %s", json.dumps(body)[:1000])
-
-    messages = body if isinstance(body, list) else [body]
-    responses = []
-
-    for msg in messages:
-        resp = await build_response(msg)
-        if resp is not None:
-            responses.append(resp)
-            # Also push onto the SSE queue for completeness
-            q = _sessions.get(session_id) or (next(iter(_sessions.values())) if _sessions else None)
-            if q:
-                await q.put(resp)
-                log.info("POST queued response to SSE session=%s", session_id)
-            else:
-                log.warning("POST no active SSE session found! session_id=%s known=%s",
-                            session_id, list(_sessions.keys()))
-
-    elapsed = (time.time() - t0) * 1000
-    log.info("POST handled in %.1fms, returning %d response(s)", elapsed, len(responses))
-
-    if len(responses) == 1:
-        return JSONResponse(responses[0], status_code=200)
-    if len(responses) > 1:
-        return JSONResponse(responses, status_code=200)
-
-    return JSONResponse({"status": "accepted"}, status_code=202)
-
-
-# ---------------------------------------------------------------------------
-# Debug endpoint – dump current state
-# ---------------------------------------------------------------------------
-@app.get("/debug")
-async def debug():
-    return {
-        "active_sessions": list(_sessions.keys()),
-        "session_count": len(_sessions),
-        "gemini_key_set": bool(GEMINI_API_KEY),
-        "tools_count": len(TOOLS),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
-@app.get("/health")
-async def health():
-    log.info("Health check called")
-    return {"status": "ok", "service": "Pega2Gemini MCP", "sessions": len(_sessions)}
+async def mcp_message(request: Request, session_id: str):
+    body = await request.json()
+    queue = _sessions.get(session_id)
+    if not queue:
+        return JSONResponse({"error": "Invalid session"}, status_code=404)
+    
+    response = await build_response(body)
+    if response:
+        await queue.put(response)
+    return JSONResponse({"status": "ok"})
