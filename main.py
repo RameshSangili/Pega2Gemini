@@ -301,4 +301,4 @@ async def mcp_messages(request: Request, session_id: str = ""):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini MCP", "sessions": len(_sessions)}
+    return {"status": "ok", "service": "Pega 2 Gemini MCP", "sessions": len(_sessions)}
