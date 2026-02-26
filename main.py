@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio
 import json
 import os
+import uuid
 import httpx
 
 app = FastAPI(title="Pega2Gemini", version="0.1.0")
@@ -19,7 +20,13 @@ GEMINI_URL: str = (
 )
 
 # ---------------------------------------------------------------------------
-# Tool definitions (MCP schema format)
+# Per-session queues { session_id -> asyncio.Queue }
+# Each SSE connection gets its own queue so responses go to the right client
+# ---------------------------------------------------------------------------
+_sessions: dict = {}
+
+# ---------------------------------------------------------------------------
+# Tool definitions (MCP inputSchema format)
 # ---------------------------------------------------------------------------
 TOOLS: list = [
     {
@@ -32,7 +39,7 @@ TOOLS: list = [
             "type": "object",
             "properties": {
                 "income": {"type": "number", "description": "Monthly income in USD"},
-                "credit_score": {"type": "integer", "description": "Credit score (300-850)"},
+                "credit_score": {"type": "integer", "description": "Credit score 300-850"},
                 "employment": {"type": "string", "description": "employed | self-employed | unemployed"},
                 "loan_amount": {"type": "number", "description": "Requested loan amount in USD"},
             },
@@ -42,8 +49,8 @@ TOOLS: list = [
     {
         "name": "loan_recommendation",
         "description": (
-            "Recommend the best loan product (personal, home, auto, etc.) "
-            "for the applicant's profile and explain the reasoning."
+            "Recommend the best loan product for the applicant's profile "
+            "and explain interest rate range, tenure options and caveats."
         ),
         "inputSchema": {
             "type": "object",
@@ -74,12 +81,6 @@ TOOLS: list = [
         },
     },
 ]
-
-# ---------------------------------------------------------------------------
-# Single shared SSE queue (safe with WEB_CONCURRENCY=1 on Render)
-# ---------------------------------------------------------------------------
-_sse_queue: asyncio.Queue = asyncio.Queue()
-
 
 # ---------------------------------------------------------------------------
 # Gemini helper
@@ -135,7 +136,7 @@ async def dispatch_tool(tool_name: str, arguments: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MCP JSON-RPC handler
+# MCP JSON-RPC handler – returns response dict or None for notifications
 # ---------------------------------------------------------------------------
 async def handle_mcp_message(message: dict):
     method: str = message.get("method", "")
@@ -153,7 +154,7 @@ async def handle_mcp_message(message: dict):
         }
 
     if method == "notifications/initialized":
-        return None # notification – no response needed
+        return None
 
     if method == "tools/list":
         return {
@@ -190,21 +191,56 @@ async def handle_mcp_message(message: dict):
 
 
 # ---------------------------------------------------------------------------
-# GET /mcp/ – SSE stream that Pega listens on
+# GET /mcp/ – SSE stream
+#
+# KEY FIX: We immediately send the MCP handshake (initialize + tools/list)
+# as soon as the client connects, WITHOUT waiting for POSTed requests.
+# This is what Pega actually expects – it opens the SSE stream and waits
+# for the server to announce itself, then sends tool-call requests via POST.
 # ---------------------------------------------------------------------------
 @app.get("/mcp/")
 async def mcp_sse(request: Request):
+    session_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    _sessions[session_id] = queue
 
     async def event_generator():
-        # Tell Pega where to POST its JSON-RPC requests
-        yield "event: endpoint\ndata: /mcp/messages/\n\n"
+        try:
+            # ── Step 1: tell Pega where to POST requests ─────────────────
+            yield f"event: endpoint\ndata: /mcp/messages/?session_id={session_id}\n\n"
 
-        while not await request.is_disconnected():
-            try:
-                msg = await asyncio.wait_for(_sse_queue.get(), timeout=15.0)
-                yield f"data: {json.dumps(msg)}\n\n"
-            except asyncio.TimeoutError:
-                yield ": keep-alive\n\n" # prevents Render/nginx closing idle stream
+            # ── Step 2: immediately send initialize response ──────────────
+            # Pega's SSE MCP client expects the server to proactively send
+            # its initialize result right after the endpoint event.
+            init_response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "Pega2Gemini", "version": "0.1.0"},
+                },
+            }
+            yield f"data: {json.dumps(init_response)}\n\n"
+
+            # ── Step 3: immediately send tools list ───────────────────────
+            tools_response = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": TOOLS},
+            }
+            yield f"data: {json.dumps(tools_response)}\n\n"
+
+            # ── Step 4: keep stream alive, drain queue for tool responses ─
+            while not await request.is_disconnected():
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+
+        finally:
+            _sessions.pop(session_id, None)
 
     return StreamingResponse(
         event_generator(),
@@ -212,7 +248,7 @@ async def mcp_sse(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no", # critical: stops nginx buffering on Render
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -221,24 +257,33 @@ async def mcp_sse(request: Request):
 # POST /mcp/messages/ – Pega POSTs JSON-RPC requests here
 # ---------------------------------------------------------------------------
 @app.post("/mcp/messages/")
-async def mcp_messages(request: Request):
+async def mcp_messages(request: Request, session_id: str = ""):
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            },
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32700, "message": "Parse error"}},
             status_code=400,
+        )
+
+    # Find the right session queue (fall back to first available)
+    queue = _sessions.get(session_id)
+    if queue is None and _sessions:
+        queue = next(iter(_sessions.values()))
+
+    if queue is None:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32000, "message": "No active SSE session"}},
+            status_code=503,
         )
 
     messages = body if isinstance(body, list) else [body]
     for msg in messages:
         response = await handle_mcp_message(msg)
         if response is not None:
-            await _sse_queue.put(response)
+            await queue.put(response)
 
     return JSONResponse({"status": "accepted"}, status_code=202)
 
@@ -248,6 +293,4 @@ async def mcp_messages(request: Request):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini MCP"}
-
-
+    return {"status": "ok", "service": "Pega2Gemini MCP", "sessions": len(_sessions)}
