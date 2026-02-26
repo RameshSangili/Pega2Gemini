@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio
@@ -10,8 +12,8 @@ app = FastAPI(title="Pega2Gemini", version="0.1.0")
 # ---------------------------------------------------------------------------
 # Configuration – set GEMINI_API_KEY as an environment variable in Render
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = (
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL: str = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-1.5-flash:generateContent"
 )
@@ -19,7 +21,7 @@ GEMINI_URL = (
 # ---------------------------------------------------------------------------
 # Tool definitions (MCP schema format)
 # ---------------------------------------------------------------------------
-TOOLS = [
+TOOLS: list = [
     {
         "name": "eligibility_check",
         "description": (
@@ -48,8 +50,8 @@ TOOLS = [
             "properties": {
                 "purpose": {"type": "string", "description": "Purpose of the loan"},
                 "amount": {"type": "number", "description": "Loan amount in USD"},
-                "credit_score": {"type": "integer","description": "Applicant credit score"},
-                "tenure_months":{"type": "integer","description": "Desired repayment period in months"},
+                "credit_score": {"type": "integer", "description": "Applicant credit score"},
+                "tenure_months": {"type": "integer", "description": "Desired repayment period in months"},
             },
             "required": ["purpose", "amount", "credit_score"],
         },
@@ -74,18 +76,21 @@ TOOLS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Helper – call Gemini
+# Single shared SSE queue (safe with WEB_CONCURRENCY=1 on Render)
+# ---------------------------------------------------------------------------
+_sse_queue: asyncio.Queue = asyncio.Queue()
+
+
+# ---------------------------------------------------------------------------
+# Gemini helper
 # ---------------------------------------------------------------------------
 async def call_gemini(prompt: str) -> str:
-    """Send a prompt to Gemini and return the text response."""
     if not GEMINI_API_KEY:
-        return "ERROR: GEMINI_API_KEY environment variable is not set."
-
+        return "ERROR: GEMINI_API_KEY environment variable is not set on Render."
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
     }
-
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(
@@ -100,49 +105,42 @@ async def call_gemini(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool dispatcher – build a natural-language prompt then call Gemini
+# Tool dispatcher
 # ---------------------------------------------------------------------------
 async def dispatch_tool(tool_name: str, arguments: dict) -> str:
+    args_json = json.dumps(arguments, indent=2)
     prompts = {
         "eligibility_check": (
             "You are a loan underwriting assistant. "
-            "Given the following applicant details, decide whether they are eligible for a loan "
+            "Given the following applicant details decide whether they are eligible for a loan "
             "and explain why.\n\nApplicant details:\n"
-            + json.dumps(arguments, indent=2)
-            + "\n\nProvide a clear YES or NO eligibility decision followed by a brief explanation."
+            + args_json
+            + "\n\nProvide a clear YES or NO decision followed by a brief explanation."
         ),
         "loan_recommendation": (
-            "You are a loan advisor. Recommend the best loan product for this applicant and "
-            "explain the interest rate range, tenure options, and any caveats.\n\nApplicant details:\n"
-            + json.dumps(arguments, indent=2)
+            "You are a loan advisor. Recommend the best loan product for this applicant "
+            "and explain interest rate range, tenure options, and any caveats.\n\nApplicant:\n"
+            + args_json
         ),
         "credit_summary": (
             "You are a credit analyst. Summarise the credit profile below, highlight the top "
-            "3 risk factors, and suggest what the applicant can do to improve their score.\n\n"
-            "Credit details:\n"
-            + json.dumps(arguments, indent=2)
+            "3 risk factors, and suggest improvements.\n\nCredit details:\n"
+            + args_json
         ),
     }
-
     prompt = prompts.get(tool_name)
     if not prompt:
         return f"Unknown tool: {tool_name}"
-
     return await call_gemini(prompt)
 
 
 # ---------------------------------------------------------------------------
-# MCP message handler
+# MCP JSON-RPC handler
 # ---------------------------------------------------------------------------
-async def handle_mcp_message(message: dict) -> dict | None:
-    """
-    Process one JSON-RPC 2.0 message and return the response dict,
-    or None if no response is needed (notifications).
-    """
-    method = message.get("method", "")
-    msg_id = message.get("id") # may be None for notifications
+async def handle_mcp_message(message: dict):
+    method: str = message.get("method", "")
+    msg_id = message.get("id")
 
-    # ── initialize ──────────────────────────────────────────────────────────
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -154,11 +152,9 @@ async def handle_mcp_message(message: dict) -> dict | None:
             },
         }
 
-    # ── initialized (notification – no response needed) ─────────────────────
     if method == "notifications/initialized":
-        return None
+        return None # notification – no response needed
 
-    # ── tools/list ──────────────────────────────────────────────────────────
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
@@ -166,14 +162,11 @@ async def handle_mcp_message(message: dict) -> dict | None:
             "result": {"tools": TOOLS},
         }
 
-    # ── tools/call ──────────────────────────────────────────────────────────
     if method == "tools/call":
         params = message.get("params", {})
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
-
         result_text = await dispatch_tool(tool_name, arguments)
-
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -183,11 +176,9 @@ async def handle_mcp_message(message: dict) -> dict | None:
             },
         }
 
-    # ── ping ────────────────────────────────────────────────────────────────
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-    # ── unknown method ───────────────────────────────────────────────────────
     if msg_id is not None:
         return {
             "jsonrpc": "2.0",
@@ -199,35 +190,21 @@ async def handle_mcp_message(message: dict) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# SSE endpoint – GET /mcp/
-# Pega sends JSON-RPC messages as query-param or request body via POST;
-# for SSE transport the client POSTs to a separate endpoint and listens here.
-#
-# Pega's MCP connector (SSE mode) works like this:
-# 1. Client opens GET /mcp/ → server keeps the SSE stream open
-# 2. Client POSTs JSON-RPC requests to POST /mcp/
-# 3. Server sends responses back on the open SSE stream
+# GET /mcp/ – SSE stream that Pega listens on
 # ---------------------------------------------------------------------------
-
-# Store active SSE queues keyed by session (simplified: single global queue)
-_sse_queue: asyncio.Queue = asyncio.Queue()
-
-
 @app.get("/mcp/")
 async def mcp_sse(request: Request):
-    """SSE stream – Pega connects here and listens for responses."""
 
     async def event_generator():
-        # Send the MCP endpoint event so Pega knows where to POST
+        # Tell Pega where to POST its JSON-RPC requests
         yield "event: endpoint\ndata: /mcp/messages/\n\n"
 
         while not await request.is_disconnected():
             try:
-                message = await asyncio.wait_for(_sse_queue.get(), timeout=15.0)
-                yield f"data: {json.dumps(message)}\n\n"
+                msg = await asyncio.wait_for(_sse_queue.get(), timeout=15.0)
+                yield f"data: {json.dumps(msg)}\n\n"
             except asyncio.TimeoutError:
-                # Send a keep-alive comment to prevent proxy/Render timeouts
-                yield ": keep-alive\n\n"
+                yield ": keep-alive\n\n" # prevents Render/nginx closing idle stream
 
     return StreamingResponse(
         event_generator(),
@@ -235,29 +212,29 @@ async def mcp_sse(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no", # important for Render / nginx proxies
+            "X-Accel-Buffering": "no", # critical: stops nginx buffering on Render
         },
     )
 
 
+# ---------------------------------------------------------------------------
+# POST /mcp/messages/ – Pega POSTs JSON-RPC requests here
+# ---------------------------------------------------------------------------
 @app.post("/mcp/messages/")
 async def mcp_messages(request: Request):
-    """
-    Pega POSTs JSON-RPC requests here.
-    We process them and push responses onto the SSE queue.
-    """
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": None,
-             "error": {"code": -32700, "message": "Parse error"}},
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error"},
+            },
             status_code=400,
         )
 
-    # Handle batch or single message
     messages = body if isinstance(body, list) else [body]
-
     for msg in messages:
         response = await handle_mcp_message(msg)
         if response is not None:
@@ -272,3 +249,5 @@ async def mcp_messages(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "Pega2Gemini MCP"}
+
+
