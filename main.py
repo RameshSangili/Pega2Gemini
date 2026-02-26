@@ -1,17 +1,30 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio
 import json
+import logging
 import os
+import time
 import uuid
+
 import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+# ---------------------------------------------------------------------------
+# Logging – verbose, timestamped, goes straight to Render's log stream
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("pega2gemini")
 
 app = FastAPI(title="Pega2Gemini", version="0.1.0")
 
 # ---------------------------------------------------------------------------
-# Configuration – set GEMINI_API_KEY as an environment variable in Render
+# Config
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL: str = (
@@ -20,15 +33,12 @@ GEMINI_URL: str = (
 )
 
 # ---------------------------------------------------------------------------
-# Tool definitions
+# Tools
 # ---------------------------------------------------------------------------
 TOOLS: list = [
     {
         "name": "eligibility_check",
-        "description": (
-            "Check whether an applicant is eligible for a loan based on "
-            "income, credit score, employment status and requested amount."
-        ),
+        "description": "Check loan eligibility based on income, credit score, employment and amount.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -42,27 +52,21 @@ TOOLS: list = [
     },
     {
         "name": "loan_recommendation",
-        "description": (
-            "Recommend the best loan product for the applicant profile "
-            "and explain interest rate range, tenure options and caveats."
-        ),
+        "description": "Recommend the best loan product for the applicant profile.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "purpose": {"type": "string", "description": "Purpose of the loan"},
                 "amount": {"type": "number", "description": "Loan amount in USD"},
                 "credit_score": {"type": "integer", "description": "Applicant credit score"},
-                "tenure_months": {"type": "integer", "description": "Desired repayment period in months"},
+                "tenure_months": {"type": "integer", "description": "Repayment period in months"},
             },
             "required": ["purpose", "amount", "credit_score"],
         },
     },
     {
         "name": "credit_summary",
-        "description": (
-            "Summarise an applicant credit profile and highlight key "
-            "risk factors that may affect loan approval."
-        ),
+        "description": "Summarise credit profile and highlight key risk factors.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -77,30 +81,34 @@ TOOLS: list = [
 ]
 
 # ---------------------------------------------------------------------------
-# Per-session queues { session_id -> asyncio.Queue }
+# Per-session SSE queues
 # ---------------------------------------------------------------------------
 _sessions: dict = {}
 
+
 # ---------------------------------------------------------------------------
-# Gemini helper
+# Gemini
 # ---------------------------------------------------------------------------
 async def call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
-        return "ERROR: GEMINI_API_KEY environment variable is not set on Render."
+        log.error("GEMINI_API_KEY is not set!")
+        return "ERROR: GEMINI_API_KEY environment variable is not set."
+    log.debug("Calling Gemini, prompt length=%d chars", len(prompt))
+    t0 = time.time()
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
     }
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(
-                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload,
-            )
+            resp = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            result = data["candidates"][0]["content"]["parts"][0]["text"]
+            log.info("Gemini responded in %.2fs, reply length=%d chars", time.time() - t0, len(result))
+            return result
     except Exception as exc:
+        log.error("Gemini call failed after %.2fs: %s", time.time() - t0, exc)
         return f"Gemini call failed: {exc}"
 
 
@@ -108,112 +116,148 @@ async def call_gemini(prompt: str) -> str:
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 async def dispatch_tool(tool_name: str, arguments: dict) -> str:
+    log.info("Dispatching tool=%s args=%s", tool_name, arguments)
     args_json = json.dumps(arguments, indent=2)
     prompts = {
         "eligibility_check": (
             "You are a loan underwriting assistant. "
-            "Given the following applicant details decide whether they are eligible for a loan "
-            "and explain why.\n\nApplicant details:\n"
-            + args_json
-            + "\n\nProvide a clear YES or NO decision followed by a brief explanation."
+            "Given the following applicant details decide whether they are eligible for a loan.\n\n"
+            + args_json + "\n\nProvide a clear YES or NO decision followed by a brief explanation."
         ),
         "loan_recommendation": (
-            "You are a loan advisor. Recommend the best loan product for this applicant "
-            "and explain interest rate range, tenure options, and any caveats.\n\nApplicant:\n"
+            "You are a loan advisor. Recommend the best loan product for this applicant.\n\n"
             + args_json
         ),
         "credit_summary": (
-            "You are a credit analyst. Summarise the credit profile below, highlight the top "
-            "3 risk factors, and suggest improvements.\n\nCredit details:\n"
+            "You are a credit analyst. Summarise the credit profile and highlight top 3 risk factors.\n\n"
             + args_json
         ),
     }
     prompt = prompts.get(tool_name)
     if not prompt:
+        log.warning("Unknown tool requested: %s", tool_name)
         return f"Unknown tool: {tool_name}"
     return await call_gemini(prompt)
 
 
 # ---------------------------------------------------------------------------
-# Build MCP response for a given request dict
+# MCP JSON-RPC builder
 # ---------------------------------------------------------------------------
 async def build_response(message: dict):
     method: str = message.get("method", "")
     msg_id = message.get("id")
+    log.info(">>> MCP request method=%s id=%s", method, msg_id)
 
     if method == "initialize":
-        return {
+        resp = {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                # KEY FIX 1: Use plain integer-parseable version string.
-                # Pega throws "Exception while converting genai tokens to integer"
-                # when it sees "2025-03-26" because it tries int("2025-03-26").
-                # "20250326" (no dashes) parses cleanly as an integer.
                 "protocolVersion": "20250326",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "Pega2Gemini", "version": "1"},
             },
         }
+        log.info("<<< Sending initialize response: %s", json.dumps(resp))
+        return resp
 
     if method == "notifications/initialized":
+        log.info("<<< notifications/initialized received (no response)")
         return None
 
     if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {"tools": TOOLS},
-        }
+        resp = {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+        log.info("<<< Sending tools/list with %d tools", len(TOOLS))
+        return resp
 
     if method == "tools/call":
         params = message.get("params", {})
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
+        log.info("<<< tools/call tool=%s", tool_name)
         result_text = await dispatch_tool(tool_name, arguments)
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {
-                "content": [{"type": "text", "text": result_text}],
-                "isError": False,
-            },
+            "result": {"content": [{"type": "text", "text": result_text}], "isError": False},
         }
 
     if method == "ping":
+        log.info("<<< pong")
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
+    log.warning("Unknown method=%s id=%s", method, msg_id)
     if msg_id is not None:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
-
+        return {"jsonrpc": "2.0", "id": msg_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}}
     return None
 
 
 # ---------------------------------------------------------------------------
-# GET /mcp/ – SSE stream Pega listens on
-#
-# KEY FIX 2: Send initialize + tools/list IMMEDIATELY on connect so Pega
-# gets them within its 30-second window before any POST is needed.
-# Then keep the stream alive for tool-call responses via the queue.
+# DIAGNOSTIC MIDDLEWARE – logs every request/response with full headers+body
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    req_id = str(uuid.uuid4())[:8]
+    t0 = time.time()
+
+    # Log request
+    body_bytes = await request.body()
+    body_str = body_bytes.decode("utf-8", errors="replace")[:2000]
+
+    log.info(
+        "==> REQ [%s] %s %s | headers=%s | body=%s",
+        req_id,
+        request.method,
+        request.url,
+        dict(request.headers),
+        body_str if body_str else "<empty>",
+    )
+
+    # Reconstruct request body so downstream can re-read it
+    async def receive():
+        return {"type": "http.request", "body": body_bytes}
+
+    request._receive = receive
+
+    response = await call_next(request)
+    elapsed = (time.time() - t0) * 1000
+
+    log.info(
+        "<== RES [%s] status=%d elapsed=%.1fms",
+        req_id,
+        response.status_code,
+        elapsed,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /mcp/ – SSE stream
 # ---------------------------------------------------------------------------
 @app.get("/mcp/")
 async def mcp_sse(request: Request):
     session_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
     _sessions[session_id] = queue
+    client_host = request.client.host if request.client else "unknown"
+
+    log.info(
+        "SSE CONNECT session=%s client=%s | total_sessions=%d",
+        session_id, client_host, len(_sessions),
+    )
 
     async def event_generator():
         try:
-            # Step 1: Advertise POST endpoint with session_id
-            yield f"event: endpoint\ndata: /mcp/messages/?session_id={session_id}\n\n"
+            t_connect = time.time()
 
-            # Step 2: Immediately push initialize result
-            # (Pega's SSE MCP client expects server to self-announce)
-            yield "data: " + json.dumps({
+            # 1. Send endpoint event
+            endpoint_event = f"event: endpoint\ndata: /mcp/messages/?session_id={session_id}\n\n"
+            log.info("SSE [%s] sending endpoint event -> /mcp/messages/?session_id=%s", session_id, session_id)
+            yield endpoint_event
+
+            # 2. Immediately send initialize result
+            init_resp = {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": {
@@ -221,25 +265,36 @@ async def mcp_sse(request: Request):
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "Pega2Gemini", "version": "1"},
                 },
-            }) + "\n\n"
+            }
+            log.info("SSE [%s] sending proactive initialize result", session_id)
+            yield f"data: {json.dumps(init_resp)}\n\n"
 
-            # Step 3: Immediately push tools list
-            yield "data: " + json.dumps({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "result": {"tools": TOOLS},
-            }) + "\n\n"
+            # 3. Immediately send tools/list result
+            tools_resp = {"jsonrpc": "2.0", "id": 2, "result": {"tools": TOOLS}}
+            log.info("SSE [%s] sending proactive tools/list (%d tools)", session_id, len(TOOLS))
+            yield f"data: {json.dumps(tools_resp)}\n\n"
 
-            # Step 4: Stay alive and stream tool-call responses
+            log.info("SSE [%s] handshake complete in %.1fms – waiting for tool calls",
+                     session_id, (time.time() - t_connect) * 1000)
+
+            # 4. Keep alive, drain tool-call responses
+            last_ping = time.time()
             while not await request.is_disconnected():
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    msg = await asyncio.wait_for(queue.get(), timeout=10.0)
+                    log.info("SSE [%s] pushing response to stream: %s", session_id, json.dumps(msg)[:300])
                     yield f"data: {json.dumps(msg)}\n\n"
                 except asyncio.TimeoutError:
+                    now = time.time()
+                    log.debug("SSE [%s] keep-alive (connected %.0fs)", session_id, now - t_connect)
+                    last_ping = now
                     yield ": keep-alive\n\n"
 
+        except Exception as exc:
+            log.error("SSE [%s] stream error: %s", session_id, exc, exc_info=True)
         finally:
             _sessions.pop(session_id, None)
+            log.info("SSE [%s] DISCONNECTED | remaining_sessions=%d", session_id, len(_sessions))
 
     return StreamingResponse(
         event_generator(),
@@ -253,52 +308,69 @@ async def mcp_sse(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# POST /mcp/messages/
-#
-# KEY FIX 3: Instead of returning 202 Accepted (async) we process the
-# request SYNCHRONOUSLY and return the actual JSON-RPC response in the
-# HTTP response body. This gives Pega an immediate answer without waiting
-# for the SSE stream, which eliminates the timeout race condition.
-# We ALSO push the response onto the SSE queue so the stream stays in sync.
+# POST /mcp/messages/ – synchronous JSON-RPC handler
 # ---------------------------------------------------------------------------
 @app.post("/mcp/messages/")
 async def mcp_messages(request: Request, session_id: str = ""):
+    t0 = time.time()
+    client_host = request.client.host if request.client else "unknown"
+    log.info("POST /mcp/messages/ session=%s client=%s", session_id, client_host)
+
     try:
         body = await request.json()
-    except Exception:
+    except Exception as exc:
+        log.error("POST parse error: %s", exc)
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": None,
-             "error": {"code": -32700, "message": "Parse error"}},
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
             status_code=400,
         )
+
+    log.info("POST body: %s", json.dumps(body)[:1000])
 
     messages = body if isinstance(body, list) else [body]
     responses = []
 
     for msg in messages:
-        response = await build_response(msg)
-        if response is not None:
-            responses.append(response)
-            # Also push to SSE stream so it stays informed
-            queue = _sessions.get(session_id)
-            if queue is None and _sessions:
-                queue = next(iter(_sessions.values()))
-            if queue:
-                await queue.put(response)
+        resp = await build_response(msg)
+        if resp is not None:
+            responses.append(resp)
+            # Also push onto the SSE queue for completeness
+            q = _sessions.get(session_id) or (next(iter(_sessions.values())) if _sessions else None)
+            if q:
+                await q.put(resp)
+                log.info("POST queued response to SSE session=%s", session_id)
+            else:
+                log.warning("POST no active SSE session found! session_id=%s known=%s",
+                            session_id, list(_sessions.keys()))
 
-    # Return synchronously – Pega reads this directly, no need to wait for SSE
+    elapsed = (time.time() - t0) * 1000
+    log.info("POST handled in %.1fms, returning %d response(s)", elapsed, len(responses))
+
     if len(responses) == 1:
         return JSONResponse(responses[0], status_code=200)
     if len(responses) > 1:
         return JSONResponse(responses, status_code=200)
 
-    # Notification only (no response needed)
     return JSONResponse({"status": "accepted"}, status_code=202)
 
 
 # ---------------------------------------------------------------------------
-# Health check – also useful as a keep-alive ping target
+# Debug endpoint – dump current state
+# ---------------------------------------------------------------------------
+@app.get("/debug")
+async def debug():
+    return {
+        "active_sessions": list(_sessions.keys()),
+        "session_count": len(_sessions),
+        "gemini_key_set": bool(GEMINI_API_KEY),
+        "tools_count": len(TOOLS),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Pega 2 Gemini MCP", "sessions": len(_sessions)}
+    log.info("Health check called")
+    return {"status": "ok", "service": "Pega2Gemini MCP", "sessions": len(_sessions)}
