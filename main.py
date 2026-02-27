@@ -11,9 +11,9 @@ import uuid
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.types import ASGIApp, Scope, Receive, Send
 
-app = FastAPI(title="Pega2Gemini", version="2.5.0", redirect_slashes=False)
+# 1. Standard FastAPI setup
+app = FastAPI(title="Pega2Gemini", version="3.0.0", redirect_slashes=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,11 +23,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("pega2gemini")
 
-# 2KB padding is the secret to forcing Cloud Run's GFE to flush the buffer
+# 2KB padding is the secret to forcing Cloud Run GFE to flush the initial buffer
 GFE_FLUSH_PADDING = ": " + (" " * 2048) + "\n\n"
 
 # ---------------------------------------------------------------------------
-# MCP Logic
+# MCP Handlers
 # ---------------------------------------------------------------------------
 async def handle_message(message: dict):
     method = message.get("method", "")
@@ -83,37 +83,36 @@ async def mcp_sse(request: Request):
 
     async def event_generator():
         try:
-            # Step 1: Force GFE Flush with 2KB padding
+            # Step 1: Force GFE Flush immediately
             yield GFE_FLUSH_PADDING
             
             # Step 2: Send the actual endpoint event
             yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
-            log.info(f"SSE [{session_id}] endpoint sent")
+            log.info(f"SSE [{session_id}] initial endpoint sent")
             
-            # Step 3: Keep-Alive Loop (Vital for Instance-based billing)
+            # Step 3: Keep-Alive Loop (This MUST keep running)
             while True:
                 if await request.is_disconnected():
-                    log.info(f"SSE [{session_id}] client disconnected")
+                    log.info(f"SSE [{session_id}] disconnected")
                     break
                 await asyncio.sleep(15)
                 yield ": keep-alive\n\n"
         except Exception as exc:
-            log.error(f"SSE Stream Error: {exc}")
+            log.error(f"SSE Error: {exc}")
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform", # Vital for GFE
+            "Cache-Control": "no-cache, no-transform", # CRITICAL: stops GFE buffering
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff", # Prevents MIME-sniffing/buffering
+            "X-Content-Type-Options": "nosniff", # Prevents MIME-sniffing buffering
         },
     )
 
 # ---------------------------------------------------------------------------
-# POST Messages
+# POST Messages (Handles the JSON-RPC calls)
 # ---------------------------------------------------------------------------
 @app.post("/mcp/messages")
 @app.post("/mcp/messages/")
@@ -122,10 +121,9 @@ async def mcp_message(request: Request):
         body = await request.json()
         log.info(f"IN ==> Method: {body.get('method')} ID: {body.get('id')}")
         
-        # Pega sends a single Object, we return an Object
         res = await handle_message(body)
 
-        # Keep container alive briefly for network turns
+        # Brief pause for initialize handshake
         if body.get("method") == "initialize":
             await asyncio.sleep(0.5)
 
