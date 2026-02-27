@@ -13,10 +13,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ---------------------------------------------------------------------------
-# Pega2Gemini MCP Server for Google Cloud Run
+# Pega2Gemini MCP Server for Google Cloud Run (Protocol 2025-03-26)
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Pega2Gemini", version="0.7.0", redirect_slashes=False)
+app = FastAPI(title="Pega2Gemini", version="0.9.0", redirect_slashes=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,19 +66,40 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "income": {"type": "number"},
-                "credit_score": {"type": "integer"},
-                "loan_amount": {"type": "number"},
+                "income": {"type": "number", "description": "Monthly income in USD"},
+                "credit_score": {"type": "integer", "description": "Credit score 300-850"},
+                "loan_amount": {"type": "number", "description": "Requested loan amount in USD"},
             },
             "required": ["income", "credit_score", "loan_amount"],
         },
     }
 ]
 
+async def call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "ERROR: GEMINI_API_KEY not set."
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as exc:
+        log.error("Gemini failed: %s", exc)
+        return f"Gemini error: {exc}"
+
+# ---------------------------------------------------------------------------
+# MCP JSON-RPC Handler
+# ---------------------------------------------------------------------------
 async def handle_message(message: dict):
     method = message.get("method", "")
-    msg_id = message.get("id") 
-    
+    msg_id = message.get("id")
+    log.info("Processing MCP method=%r id=%r", method, msg_id)
+
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -89,14 +110,34 @@ async def handle_message(message: dict):
                 "serverInfo": {"name": "Pega2Gemini", "version": "1.0.0"},
             },
         }
+
+    # CRITICAL: Handle the "I'm ready" notification from Pega
+    if method == "notifications/initialized":
+        log.info("MCP Handshake finalized by Pega client.")
+        return None 
+
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+
+    if method == "tools/call":
+        params = message.get("params", {})
+        tool_name = params.get("name", "unknown")
+        args = params.get("arguments", {})
+        prompt = f"You are a loan officer. Tool: {tool_name}. Input: {json.dumps(args)}. Give a professional answer."
+        res_text = await call_gemini(prompt)
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"content": [{"type": "text", "text": res_text}], "isError": False},
+        }
+
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
-    return None
+
+    return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
 # ---------------------------------------------------------------------------
-# SSE Endpoint (GET /mcp)
+# SSE & Message Routes
 # ---------------------------------------------------------------------------
 @app.get("/mcp")
 async def mcp_sse(request: Request):
@@ -105,15 +146,16 @@ async def mcp_sse(request: Request):
 
     async def event_generator():
         try:
-            # Step 1: Push 2KB padding to clear Cloud Run/GFE buffer
-            yield GFE_FLUSH_PADDING
+            # Step 1: Force Cloud Run GFE to flush buffer immediately
+            yield GFE_FLUSH_PADDING 
             
-            # Step 2: Send the actual endpoint Pega needs
+            # Step 2: Send endpoint with absolute relative path
             yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
             log.info("SSE [%s] endpoint sent with padding", session_id)
             
             while True:
                 if await request.is_disconnected():
+                    log.info("SSE [%s] client disconnected", session_id)
                     break
                 await asyncio.sleep(15)
                 yield ": heartbeat\n\n"
@@ -125,32 +167,38 @@ async def mcp_sse(request: Request):
         media_type="text/event-stream",
         headers={
             "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform", # NO-TRANSFORM is the fix
+            "Cache-Control": "no-cache, no-transform", # CRITICAL: Disable GFE buffering
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
 
-# ---------------------------------------------------------------------------
-# Message Endpoint (POST /mcp/messages)
-# ---------------------------------------------------------------------------
 @app.post("/mcp/messages")
 async def mcp_message(request: Request):
-    session_id = request.query_params.get("session_id", "unknown")
     try:
         body = await request.json()
-        log.info("POST session=%s method=%s", session_id, body.get("method"))
+        log.info("POST REQ: %s", body.get("method"))
         
-        # Handle batch or single message
-        msgs = body if isinstance(body, list) else [body]
+        # Determine if it's a list (batch) or single message
+        messages = body if isinstance(body, list) else [body]
         responses = []
-        for m in msgs:
-            r = await handle_message(m)
-            if r: responses.append(r)
+        
+        for msg in messages:
+            resp = await handle_message(msg)
+            if resp is not None:
+                responses.append(resp)
+        
+        # KEEP-ALIVE: Wait slightly after 'initialize' to ensure container 
+        # doesn't shut down before Pega's next notification arrives.
+        if any(m.get("method") == "initialize" for m in messages):
+            await asyncio.sleep(0.5) 
             
         if len(responses) == 1:
             return JSONResponse(responses[0])
-        return JSONResponse(responses) if responses else JSONResponse({"status":"ok"}, status_code=202)
+        elif len(responses) > 1:
+            return JSONResponse(responses)
+            
+        return JSONResponse({"status": "accepted"}, status_code=202)
         
     except Exception as exc:
         log.error("POST error: %s", exc)
@@ -158,4 +206,4 @@ async def mcp_message(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "Pega2Gemini MCP"}
