@@ -13,11 +13,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ---------------------------------------------------------------------------
-# CRITICAL FIX: Disable FastAPI's automatic redirect from /mcp to /mcp/
-# Cloud Run was returning 307 for /mcp -> /mcp/ and Apache-CXF (Pega's
-# Java HTTP client) does NOT follow 307 redirects on SSE connections.
+# Streamable HTTP MCP Server (protocol version 2025-03-26)
+#
+# KEY INSIGHT: Pega uses the NEW Streamable HTTP transport, not old SSE.
+# In Streamable HTTP:
+# - ALL messages go to POST /mcp (single endpoint)
+# - GET /mcp opens an optional SSE stream for server-push only
+# - The client POSTs initialize directly to /mcp, not /mcp/messages
+# - Response can be JSON or SSE depending on Accept header
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Pega2Gemini", version="0.4.0", redirect_slashes=False)
+
+app = FastAPI(title="Pega2Gemini", version="0.5.0", redirect_slashes=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,13 +51,15 @@ class LoggingMiddleware:
         qs = scope.get("query_string", b"").decode()
         headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
 
-        log.info("==> REQ [%s] %s %s?%s ua=%s",
-                 req_id, method, path, qs, headers.get("user-agent", "?"))
+        log.info("==> [%s] %s %s?%s accept=%r ua=%r",
+                 req_id, method, path, qs,
+                 headers.get("accept", ""),
+                 headers.get("user-agent", ""))
 
         async def logging_send(message):
             if message["type"] == "http.response.start":
                 elapsed = (time.perf_counter() - t0) * 1000
-                log.info("<== RES [%s] status=%s elapsed=%.1fms",
+                log.info("<== [%s] status=%s elapsed=%.1fms",
                          req_id, message["status"], elapsed)
             await send(message)
 
@@ -133,11 +141,8 @@ async def call_gemini(prompt: str) -> str:
         log.error("Gemini failed: %s", exc)
         return f"Gemini error: {exc}"
 
-# ---------------------------------------------------------------------------
-# Tool Dispatcher
-# ---------------------------------------------------------------------------
 async def dispatch_tool(tool_name: str, arguments: dict) -> str:
-    log.info("Tool: %s args: %s", tool_name, arguments)
+    log.info("Tool: %s", tool_name)
     prompt = (
         f"You are an expert loan officer. Tool: {tool_name}. "
         f"Input: {json.dumps(arguments)}. Give a concise professional answer."
@@ -145,15 +150,15 @@ async def dispatch_tool(tool_name: str, arguments: dict) -> str:
     return await call_gemini(prompt)
 
 # ---------------------------------------------------------------------------
-# MCP Response Builder
+# MCP JSON-RPC handler
 # ---------------------------------------------------------------------------
-async def build_response(message: dict):
+async def handle_message(message: dict):
     method = message.get("method", "")
     msg_id = message.get("id")
-    log.info("MCP IN method=%r id=%r", method, msg_id)
+    log.info("MCP method=%r id=%r", method, msg_id)
 
     if method == "initialize":
-        resp = {
+        return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
@@ -162,59 +167,104 @@ async def build_response(message: dict):
                 "serverInfo": {"name": "Pega2Gemini", "version": "1.0.0"},
             },
         }
-    elif method == "notifications/initialized":
-        log.info("MCP notifications/initialized — no response")
-        return None
-    elif method == "tools/list":
-        resp = {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
-    elif method == "tools/call":
+
+    if method == "notifications/initialized":
+        return None # notification, no response
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+
+    if method == "tools/call":
         params = message.get("params", {})
         res_text = await dispatch_tool(params.get("name", ""), params.get("arguments", {}))
-        resp = {
+        return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {"content": [{"type": "text", "text": res_text}], "isError": False},
         }
-    elif method == "ping":
-        resp = {"jsonrpc": "2.0", "id": msg_id, "result": {}}
-    else:
-        log.warning("Unknown method: %r", method)
-        resp = {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-    log.info("MCP OUT %s", json.dumps(resp)[:300])
-    return resp
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+
+    log.warning("Unknown method: %r", method)
+    if msg_id is not None:
+        return {"jsonrpc": "2.0", "id": msg_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}}
+    return None
 
 
 # ---------------------------------------------------------------------------
-# SSE stream handler (shared logic)
+# POST /mcp — Streamable HTTP: ALL client->server messages come here
+#
+# The client sends Accept: application/json, text/event-stream
+# We respond with JSON for simple request/response.
+# For streaming tool calls we could return SSE, but JSON is fine for Pega.
 # ---------------------------------------------------------------------------
-async def _sse_handler(request: Request, session_id: str):
-    log.info("SSE OPEN session=%s path=%s", session_id, request.url.path)
+async def _handle_post(request: Request):
+    session_id = request.query_params.get("session_id", "")
+    accept = request.headers.get("accept", "")
+    log.info("POST /mcp session=%s accept=%r", session_id, accept)
+
+    try:
+        raw = await request.body()
+        log.info("POST body: %s", raw.decode("utf-8", errors="replace")[:1000])
+        body = json.loads(raw)
+    except Exception as exc:
+        log.error("Parse error: %s", exc)
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32700, "message": f"Parse error: {exc}"}},
+            status_code=400,
+        )
+
+    messages = body if isinstance(body, list) else [body]
+    responses = []
+    for msg in messages:
+        resp = await handle_message(msg)
+        if resp is not None:
+            responses.append(resp)
+
+    log.info("POST returning %d response(s)", len(responses))
+
+    if len(responses) == 1:
+        # Check if client wants SSE response format
+        if "text/event-stream" in accept and "application/json" not in accept:
+            # Wrap in SSE format
+            data = json.dumps(responses[0])
+            async def sse_gen():
+                yield f"data: {data}\n\n"
+            return StreamingResponse(sse_gen(), media_type="text/event-stream",
+                                     headers={"X-Accel-Buffering": "no"})
+        return JSONResponse(responses[0], status_code=200)
+
+    if len(responses) > 1:
+        return JSONResponse(responses, status_code=200)
+
+    # Notification only
+    return JSONResponse({}, status_code=202)
+
+
+# ---------------------------------------------------------------------------
+# GET /mcp — Optional SSE stream for server-push (Streamable HTTP spec)
+# Pega may open this to receive async notifications from server.
+# We keep it alive with pings. No tools handshake happens here anymore.
+# ---------------------------------------------------------------------------
+async def _handle_get(request: Request):
+    session_id = str(uuid.uuid4())
+    log.info("GET /mcp (SSE stream) session=%s", session_id)
 
     async def event_generator():
         try:
-            # Send the endpoint event pointing to the messages path
-            # Use the same path style Pega called us with (no trailing slash)
-            endpoint_url = f"/mcp/messages?session_id={session_id}"
-            event = f"event: endpoint\ndata: {endpoint_url}\n\n"
-            log.info("SSE [%s] sending endpoint: %s", session_id, endpoint_url)
-            yield event
-
-            t_start = time.time()
-            ping_count = 0
+            log.info("SSE [%s] opened", session_id)
+            t = time.time()
             while True:
                 if await request.is_disconnected():
-                    log.info("SSE [%s] disconnected after %.1fs", session_id, time.time() - t_start)
+                    log.info("SSE [%s] disconnected after %.0fs", session_id, time.time() - t)
                     break
                 await asyncio.sleep(10)
-                ping_count += 1
-                log.debug("SSE [%s] ping #%d", session_id, ping_count)
                 yield ": ping\n\n"
-
-        except asyncio.CancelledError:
-            log.info("SSE [%s] cancelled", session_id)
         except Exception as exc:
-            log.error("SSE [%s] error: %s", session_id, exc, exc_info=True)
+            log.error("SSE [%s] error: %s", session_id, exc)
         finally:
             log.info("SSE [%s] closed", session_id)
 
@@ -231,67 +281,33 @@ async def _sse_handler(request: Request, session_id: str):
 
 
 # ---------------------------------------------------------------------------
-# POST handler (shared logic) — fully stateless
+# Single /mcp endpoint — handles both GET and POST (Streamable HTTP spec)
+# Also registered without trailing slash to avoid 307 redirects
 # ---------------------------------------------------------------------------
-async def _post_handler(request: Request, session_id: str):
-    t0 = time.perf_counter()
-    log.info("POST session=%s path=%s", session_id, request.url.path)
-
-    try:
-        raw = await request.body()
-        log.info("POST body: %s", raw.decode("utf-8", errors="replace")[:800])
-        body = json.loads(raw)
-    except Exception as exc:
-        log.error("POST parse error: %s", exc)
-        return JSONResponse(
-            {"jsonrpc": "2.0", "id": None,
-             "error": {"code": -32700, "message": f"Parse error: {exc}"}},
-            status_code=400,
-        )
-
-    messages = body if isinstance(body, list) else [body]
-    responses = []
-    for msg in messages:
-        resp = await build_response(msg)
-        if resp is not None:
-            responses.append(resp)
-
-    elapsed = (time.perf_counter() - t0) * 1000
-    log.info("POST done %.1fms responses=%d", elapsed, len(responses))
-
-    if len(responses) == 1:
-        return JSONResponse(responses[0], status_code=200)
-    if len(responses) > 1:
-        return JSONResponse(responses, status_code=200)
-    return JSONResponse({"status": "accepted"}, status_code=202)
-
-
-# ---------------------------------------------------------------------------
-# Routes — registered for BOTH with and without trailing slash
-# This prevents the 307 redirect that kills Apache-CXF SSE connections
-# ---------------------------------------------------------------------------
-
 @app.get("/mcp")
-async def mcp_sse_noslash(request: Request):
-    """SSE endpoint without trailing slash — what Pega actually calls"""
-    session_id = str(uuid.uuid4())
-    return await _sse_handler(request, session_id)
+async def mcp_get(request: Request):
+    return await _handle_get(request)
 
 @app.get("/mcp/")
-async def mcp_sse_slash(request: Request):
-    """SSE endpoint with trailing slash — fallback"""
-    session_id = str(uuid.uuid4())
-    return await _sse_handler(request, session_id)
+async def mcp_get_slash(request: Request):
+    return await _handle_get(request)
 
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    return await _handle_post(request)
+
+@app.post("/mcp/")
+async def mcp_post_slash(request: Request):
+    return await _handle_post(request)
+
+# Keep old /mcp/messages routes for backward compat in case Pega uses them
 @app.post("/mcp/messages")
-async def mcp_post_noslash(request: Request, session_id: str = ""):
-    """POST without trailing slash"""
-    return await _post_handler(request, session_id)
+async def mcp_messages(request: Request):
+    return await _handle_post(request)
 
 @app.post("/mcp/messages/")
-async def mcp_post_slash(request: Request, session_id: str = ""):
-    """POST with trailing slash"""
-    return await _post_handler(request, session_id)
+async def mcp_messages_slash(request: Request):
+    return await _handle_post(request)
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +316,14 @@ async def mcp_post_slash(request: Request, session_id: str = ""):
 @app.get("/debug")
 async def debug():
     return {
-        "version": "0.4.0",
-        "fix": "redirect_slashes=False + dual routes for /mcp and /mcp/",
-        "root_cause": "Apache-CXF/4.1.1 does not follow 307 redirect on SSE",
+        "version": "0.5.0",
+        "transport": "Streamable HTTP (2025-03-26)",
+        "key_change": "POST /mcp handles ALL JSON-RPC — no separate /mcp/messages",
         "gemini_key_set": bool(GEMINI_API_KEY),
         "tools": [t["name"] for t in TOOLS],
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini MCP", "version": "0.4.0"}
+    return {"status": "ok", "service": "Pega2Gemini MCP", "version": "0.5.0"}
+
