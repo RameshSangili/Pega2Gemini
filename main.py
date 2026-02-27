@@ -13,17 +13,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ---------------------------------------------------------------------------
-# Streamable HTTP MCP Server (protocol version 2025-03-26)
+# Cloud Run / GFE buffering notes:
 #
-# KEY INSIGHT: Pega uses the NEW Streamable HTTP transport, not old SSE.
-# In Streamable HTTP:
-# - ALL messages go to POST /mcp (single endpoint)
-# - GET /mcp opens an optional SSE stream for server-push only
-# - The client POSTs initialize directly to /mcp, not /mcp/messages
-# - Response can be JSON or SSE depending on Accept header
+# Cloud Run's Google Front End (GFE) IGNORES X-Accel-Buffering and buffers
+# SSE chunks until it sees enough data. Fixes applied here:
+#
+# 1. Cache-Control: no-cache, no-transform ← stops GFE compression/buffering
+# 2. Transfer-Encoding: chunked ← forces streaming mode
+# 3. 2KB padding comment before endpoint ← flushes GFE's initial buffer
+# 4. Standard MCP ping: "event: ping\ndata: {}\n\n" ← not just a comment
+# 5. POST /mcp returns response wrapped in SSE if client wants event-stream
+# 6. Preserve id type from request (string vs int) ← Apache-CXF strict
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Pega2Gemini", version="0.5.0", redirect_slashes=False)
+app = FastAPI(title="Pega2Gemini", version="0.6.0", redirect_slashes=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +34,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("pega2gemini")
+
+# 2KB padding to flush Cloud Run GFE's initial buffer
+GFE_FLUSH_PADDING = ": " + (" " * 2046) + "\n\n"
+
 
 # ---------------------------------------------------------------------------
 # Logging Middleware
@@ -151,11 +158,12 @@ async def dispatch_tool(tool_name: str, arguments: dict) -> str:
 
 # ---------------------------------------------------------------------------
 # MCP JSON-RPC handler
+# FIX: Preserve id type exactly as received (Apache-CXF is strict about this)
 # ---------------------------------------------------------------------------
 async def handle_message(message: dict):
     method = message.get("method", "")
-    msg_id = message.get("id")
-    log.info("MCP method=%r id=%r", method, msg_id)
+    msg_id = message.get("id") # preserve type: string OR int, never cast
+    log.info("MCP method=%r id=%r (type=%s)", method, msg_id, type(msg_id).__name__)
 
     if method == "initialize":
         return {
@@ -169,7 +177,7 @@ async def handle_message(message: dict):
         }
 
     if method == "notifications/initialized":
-        return None # notification, no response
+        return None
 
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
@@ -194,11 +202,69 @@ async def handle_message(message: dict):
 
 
 # ---------------------------------------------------------------------------
-# POST /mcp — Streamable HTTP: ALL client->server messages come here
+# SSE response headers — Cloud Run GFE requires no-transform
+# ---------------------------------------------------------------------------
+SSE_HEADERS = {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform", # no-transform stops GFE buffering
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no", # for nginx-based proxies
+    "Transfer-Encoding": "chunked", # force streaming
+    "Access-Control-Allow-Origin": "*",
+}
+
+
+# ---------------------------------------------------------------------------
+# GET /mcp — SSE stream
 #
-# The client sends Accept: application/json, text/event-stream
-# We respond with JSON for simple request/response.
-# For streaming tool calls we could return SSE, but JSON is fine for Pega.
+# FIX 1: Send 2KB padding first to flush GFE's initial buffer
+# FIX 2: Use proper MCP ping format: event:ping + data:{} not just a comment
+# ---------------------------------------------------------------------------
+async def _handle_get(request: Request):
+    session_id = str(uuid.uuid4())
+    log.info("GET /mcp SSE session=%s", session_id)
+
+    async def event_generator():
+        try:
+            # FIX: 2KB padding comment to force GFE to flush its buffer
+            # GFE buffers until it has ~4KB before sending to client
+            log.info("SSE [%s] sending GFE flush padding", session_id)
+            yield GFE_FLUSH_PADDING
+
+            # Send endpoint event
+            endpoint_url = f"/mcp/messages?session_id={session_id}"
+            event = f"event: endpoint\ndata: {endpoint_url}\n\n"
+            log.info("SSE [%s] sending endpoint: %s", session_id, endpoint_url)
+            yield event
+
+            t_start = time.time()
+            ping_count = 0
+            while True:
+                if await request.is_disconnected():
+                    log.info("SSE [%s] disconnected after %.0fs", session_id, time.time() - t_start)
+                    break
+                await asyncio.sleep(15)
+                ping_count += 1
+                # FIX: Standard MCP ping format with data payload, not just a comment
+                ping_event = "event: ping\ndata: {}\n\n"
+                log.debug("SSE [%s] ping #%d", session_id, ping_count)
+                yield ping_event
+
+        except asyncio.CancelledError:
+            log.info("SSE [%s] cancelled", session_id)
+        except Exception as exc:
+            log.error("SSE [%s] error: %s", session_id, exc, exc_info=True)
+        finally:
+            log.info("SSE [%s] closed", session_id)
+
+    return StreamingResponse(event_generator(), headers=SSE_HEADERS)
+
+
+# ---------------------------------------------------------------------------
+# POST /mcp — ALL JSON-RPC messages (Streamable HTTP 2025-03-26)
+#
+# FIX: When client sends Accept: text/event-stream, wrap response in SSE.
+# Pega's Apache-CXF client may send this header expecting SSE-wrapped JSON.
 # ---------------------------------------------------------------------------
 async def _handle_post(request: Request):
     session_id = request.query_params.get("session_id", "")
@@ -224,65 +290,33 @@ async def _handle_post(request: Request):
         if resp is not None:
             responses.append(resp)
 
-    log.info("POST returning %d response(s)", len(responses))
+    log.info("POST %d response(s)", len(responses))
 
-    if len(responses) == 1:
-        # Check if client wants SSE response format
-        if "text/event-stream" in accept and "application/json" not in accept:
-            # Wrap in SSE format
-            data = json.dumps(responses[0])
-            async def sse_gen():
-                yield f"data: {data}\n\n"
-            return StreamingResponse(sse_gen(), media_type="text/event-stream",
-                                     headers={"X-Accel-Buffering": "no"})
-        return JSONResponse(responses[0], status_code=200)
+    # No response needed (notification)
+    if not responses:
+        return JSONResponse({}, status_code=202)
 
-    if len(responses) > 1:
-        return JSONResponse(responses, status_code=200)
+    result = responses[0] if len(responses) == 1 else responses
 
-    # Notification only
-    return JSONResponse({}, status_code=202)
+    # FIX: If client wants SSE format, wrap in SSE event
+    # This handles cases where Apache-CXF sends Accept: text/event-stream
+    wants_sse = "text/event-stream" in accept
+    wants_json = "application/json" in accept
 
+    if wants_sse and not wants_json:
+        log.info("POST returning SSE-wrapped response")
+        data = json.dumps(result)
+        async def sse_response():
+            yield GFE_FLUSH_PADDING
+            yield f"event: message\ndata: {data}\n\n"
+        return StreamingResponse(sse_response(), headers=SSE_HEADERS)
 
-# ---------------------------------------------------------------------------
-# GET /mcp — Optional SSE stream for server-push (Streamable HTTP spec)
-# Pega may open this to receive async notifications from server.
-# We keep it alive with pings. No tools handshake happens here anymore.
-# ---------------------------------------------------------------------------
-async def _handle_get(request: Request):
-    session_id = str(uuid.uuid4())
-    log.info("GET /mcp (SSE stream) session=%s", session_id)
-
-    async def event_generator():
-        try:
-            log.info("SSE [%s] opened", session_id)
-            t = time.time()
-            while True:
-                if await request.is_disconnected():
-                    log.info("SSE [%s] disconnected after %.0fs", session_id, time.time() - t)
-                    break
-                await asyncio.sleep(10)
-                yield ": ping\n\n"
-        except Exception as exc:
-            log.error("SSE [%s] error: %s", session_id, exc)
-        finally:
-            log.info("SSE [%s] closed", session_id)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+    log.info("POST returning JSON response: %s", json.dumps(result)[:300])
+    return JSONResponse(result, status_code=200)
 
 
 # ---------------------------------------------------------------------------
-# Single /mcp endpoint — handles both GET and POST (Streamable HTTP spec)
-# Also registered without trailing slash to avoid 307 redirects
+# Routes — both with and without trailing slash (avoids 307 on Apache-CXF)
 # ---------------------------------------------------------------------------
 @app.get("/mcp")
 async def mcp_get(request: Request):
@@ -300,7 +334,6 @@ async def mcp_post(request: Request):
 async def mcp_post_slash(request: Request):
     return await _handle_post(request)
 
-# Keep old /mcp/messages routes for backward compat in case Pega uses them
 @app.post("/mcp/messages")
 async def mcp_messages(request: Request):
     return await _handle_post(request)
@@ -316,14 +349,20 @@ async def mcp_messages_slash(request: Request):
 @app.get("/debug")
 async def debug():
     return {
-        "version": "0.5.0",
-        "transport": "Streamable HTTP (2025-03-26)",
-        "key_change": "POST /mcp handles ALL JSON-RPC — no separate /mcp/messages",
+        "version": "0.6.0",
+        "fixes": [
+            "no-transform header stops GFE buffering",
+            "2KB padding flushes GFE initial buffer",
+            "SSE ping uses event:ping + data:{} not comment",
+            "POST wraps in SSE when Accept: text/event-stream",
+            "id type preserved exactly as received",
+            "redirect_slashes=False avoids 307 on Apache-CXF",
+        ],
         "gemini_key_set": bool(GEMINI_API_KEY),
         "tools": [t["name"] for t in TOOLS],
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini MCP", "version": "0.5.0"}
+    return {"status": "ok", "service": "Pega2Gemini MCP", "version": "0.6.0"}
 
