@@ -1,17 +1,19 @@
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: [
-      'build',
-      '-t',
-      'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini',
-      '.'
-    ]
+    args:
+      [
+        'build',
+        '-t',
+        'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini',
+        '.'
+      ]
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: [
-      'push',
-      'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
-    ]
+    args:
+      [
+        'push',
+        'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
+      ]
 
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
@@ -23,3 +25,6 @@ steps:
         '--platform','managed',
         '--allow-unauthenticated'
       ]
+
+options:
+  logging: CLOUD_LOGGING_ONLY
