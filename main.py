@@ -9,14 +9,12 @@ import time
 import uuid
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Scope, Receive, Send
 
-# 1. Initialize FastAPI
-app = FastAPI(title="Pega2Gemini", version="1.4.0", redirect_slashes=False)
+app = FastAPI(title="Pega2Gemini", version="1.5.0", redirect_slashes=False)
 
-# 2. Cloud-Native Logging
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
@@ -25,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("pega2gemini")
 
-# 2KB padding forces GFE to flush
+# 2KB padding is the minimum required to force Google Front End (GFE) to flush
 GFE_FLUSH_PADDING = ": " + (" " * 2048) + "\n\n"
 
 # ---------------------------------------------------------------------------
@@ -75,7 +73,7 @@ async def handle_message(message: dict):
     return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
 # ---------------------------------------------------------------------------
-# Routes
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/mcp")
@@ -86,19 +84,19 @@ async def mcp_sse(request: Request):
 
     async def event_generator():
         try:
-            # Step 1: Force GFE Flush
+            # 1. Force GFE buffer flush immediately
             yield GFE_FLUSH_PADDING
             
-            # Step 2: Send Endpoint
+            # 2. Send the endpoint Pega expects
             yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
             log.info(f"SSE [{session_id}] endpoint sent")
             
-            # Step 3: Keep-Alive Loop
+            # 3. Keep the loop alive indefinitely
             while True:
                 if await request.is_disconnected():
-                    log.info(f"SSE [{session_id}] disconnected")
+                    log.info(f"SSE [{session_id}] client disconnected")
                     break
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
                 yield ": keep-alive\n\n"
         except Exception as e:
             log.error(f"SSE Error: {e}")
@@ -108,10 +106,10 @@ async def mcp_sse(request: Request):
         media_type="text/event-stream",
         headers={
             "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform", 
+            "Cache-Control": "no-cache, no-transform", # Disable Cloud Run GFE buffering
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff", # Prevents GFE from sniffing/buffering
+            "X-Content-Type-Options": "nosniff", # Prevents GFE from sniffing the stream
         },
     )
 
@@ -122,9 +120,10 @@ async def mcp_message(request: Request):
         body = await request.json()
         log.info(f"IN ==> Method: {body.get('method')} ID: {body.get('id')}")
         
-        # Pega sends Object, we return Object.
+        # Pega sends an Object, handle_message returns an Object
         res = await handle_message(body)
 
+        # Small delay for initialization turn
         if body.get("method") == "initialize":
             await asyncio.sleep(0.5)
 
