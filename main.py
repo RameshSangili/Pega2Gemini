@@ -9,12 +9,14 @@ import time
 import uuid
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Scope, Receive, Send
 
+# 1. Initialize FastAPI (Disable auto-redirects to stop 307 loops)
 app = FastAPI(title="Pega2Gemini", version="1.5.0", redirect_slashes=False)
 
+# 2. Cloud-Native Logging (stderr ensures logs appear in Cloud Run console)
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
@@ -23,7 +25,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("pega2gemini")
 
-# 2KB padding is the minimum required to force Google Front End (GFE) to flush
+# 2KB padding is mandatory to force Google Front End (GFE) to flush the buffer
 GFE_FLUSH_PADDING = ": " + (" " * 2048) + "\n\n"
 
 # ---------------------------------------------------------------------------
@@ -45,7 +47,7 @@ async def handle_message(message: dict):
         }
     
     if method == "notifications/initialized":
-        log.info("==> Handshake Finalized")
+        log.info("==> Handshake Finalized by Pega")
         return None
 
     if method == "tools/list":
@@ -57,12 +59,12 @@ async def handle_message(message: dict):
                 "tools": [
                     {
                         "name": "eligibility_check",
-                        "description": "Check loan eligibility",
+                        "description": "Check loan eligibility based on profile",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "income": {"type": "number"},
-                                "credit_score": {"type": "integer"}
+                                "income": {"type": "number", "description": "Monthly income"},
+                                "credit_score": {"type": "integer", "description": "Credit score"}
                             },
                             "required": ["income", "credit_score"]
                         }
@@ -70,6 +72,7 @@ async def handle_message(message: dict):
                 ]
             }
         }
+    
     return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
 # ---------------------------------------------------------------------------
@@ -84,32 +87,32 @@ async def mcp_sse(request: Request):
 
     async def event_generator():
         try:
-            # 1. Force GFE buffer flush immediately
+            # Step 1: Force GFE Flush with 2KB padding
             yield GFE_FLUSH_PADDING
             
-            # 2. Send the endpoint Pega expects
+            # Step 2: Send endpoint with absolute relative path
             yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
             log.info(f"SSE [{session_id}] endpoint sent")
             
-            # 3. Keep the loop alive indefinitely
+            # Step 3: Heartbeat Loop (Keeps Cloud Run socket active)
             while True:
                 if await request.is_disconnected():
                     log.info(f"SSE [{session_id}] client disconnected")
                     break
                 await asyncio.sleep(15)
-                yield ": keep-alive\n\n"
-        except Exception as e:
-            log.error(f"SSE Error: {e}")
+                yield ": heartbeat\n\n"
+        except Exception as exc:
+            log.error(f"SSE Stream Error: {exc}")
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache, no-transform", # Disable Cloud Run GFE buffering
+            "Cache-Control": "no-cache, no-transform", # Vital for Cloud Run
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            "X-Content-Type-Options": "nosniff", # Prevents GFE from sniffing the stream
+            "X-Content-Type-Options": "nosniff", # Prevents GFE buffering
         },
     )
 
@@ -120,16 +123,24 @@ async def mcp_message(request: Request):
         body = await request.json()
         log.info(f"IN ==> Method: {body.get('method')} ID: {body.get('id')}")
         
-        # Pega sends an Object, handle_message returns an Object
-        res = await handle_message(body)
+        # Determine if Pega sent a single object or a list
+        is_list = isinstance(body, list)
+        messages = body if is_list else [body]
+        
+        results = []
+        for m in messages:
+            res = await handle_message(m)
+            if res: results.append(res)
 
-        # Small delay for initialization turn
-        if body.get("method") == "initialize":
-            await asyncio.sleep(0.5)
+        # Keep container alive briefly for 'initialize' turn-around
+        if any(m.get("method") == "initialize" for m in messages):
+            await asyncio.sleep(0.8)
 
-        if res:
-            return JSONResponse(res)
-        return JSONResponse({"status": "accepted"}, status_code=202)
+        if not results:
+            return JSONResponse({"status": "accepted"}, status_code=202)
+
+        # CRITICAL: Return Object for Object, List for List to satisfy Apache-CXF
+        return JSONResponse(results if is_list else results[0])
         
     except Exception as e:
         log.error(f"POST Error: {e}")
