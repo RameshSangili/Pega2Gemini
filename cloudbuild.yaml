@@ -1,21 +1,16 @@
-
-
 steps:
-  # Build container
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
+      - 'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
       - '.'
 
-  # Push container
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'us-central1-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
+      - 'northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini'
 
-  # Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -23,7 +18,7 @@ steps:
       - deploy
       - pegagemini
       - --image
-      - us-central1-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini
+      - northamerica-northeast2-docker.pkg.dev/$PROJECT_ID/pegagemini/pegagemini
       - --region
       - northamerica-northeast2
       - --platform
@@ -31,11 +26,6 @@ steps:
       - --allow-unauthenticated
       - --min-instances
       - '1'
-      - --set-env-vars
-      - GEMINI_API_KEY=$GEMINI_API_KEY
 
 options:
   logging: CLOUD_LOGGING_ONLY
-
-
-
