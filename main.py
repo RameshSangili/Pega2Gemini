@@ -230,5 +230,5 @@ async def mcp_post(request: Request):
 # ============================================================
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini HTTP MCP v2"}
+    return {"status": "ok", "service": "Pega2Gemini HTTP MCP v4"}
 
