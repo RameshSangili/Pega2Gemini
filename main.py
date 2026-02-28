@@ -2,15 +2,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
 import time
+import uuid
+import traceback
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# -------------------------------------------------------
-# Logging
-# -------------------------------------------------------
+# ============================================================
+# LOGGING (Detailed)
+# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
@@ -18,18 +19,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("pega2gemini")
 
-app = FastAPI(title="Pega2Gemini-HTTP", version="1.0.0")
+app = FastAPI(title="Pega2Gemini-HTTP", version="2.0.0")
 
-# -------------------------------------------------------
-# Environment
-# -------------------------------------------------------
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = "models/gemini-1.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/{GEMINI_MODEL}:generateContent"
 
-# -------------------------------------------------------
-# MCP Tools Definition
-# -------------------------------------------------------
+# ============================================================
+# MCP TOOLS
+# ============================================================
 TOOLS = [
     {
         "name": "eligibility_check",
@@ -68,12 +69,12 @@ TOOLS = [
             },
             "required": ["credit_score"],
         },
-    },
+    }
 ]
 
-# -------------------------------------------------------
-# Gemini Call
-# -------------------------------------------------------
+# ============================================================
+# GEMINI CALL
+# ============================================================
 async def call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
         return "ERROR: GEMINI_API_KEY not set."
@@ -85,42 +86,51 @@ async def call_gemini(prompt: str) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
+            resp = await client.post(
                 f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload,
+                json=payload
             )
-            response.raise_for_status()
-            data = response.json()
-
+            resp.raise_for_status()
+            data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        log.error("Gemini error: %s", e)
+        return f"Gemini error: {str(e)}"
 
-    except Exception as exc:
-        log.exception("Gemini call failed")
-        return f"Gemini error: {exc}"
-
-# -------------------------------------------------------
-# Tool Dispatcher
-# -------------------------------------------------------
+# ============================================================
+# TOOL DISPATCHER
+# ============================================================
 async def dispatch_tool(tool_name: str, arguments: dict) -> str:
-    log.info("Tool Call: %s | Args: %s", tool_name, arguments)
+    log.info("Dispatching tool: %s | Args: %s", tool_name, arguments)
 
     prompt = (
         "You are an expert loan officer.\n"
         f"Tool: {tool_name}\n"
-        f"Input Data: {json.dumps(arguments)}\n"
-        "Provide clear professional output."
+        f"Input: {json.dumps(arguments)}\n"
+        "Provide professional output."
     )
 
     return await call_gemini(prompt)
 
-# -------------------------------------------------------
-# MCP JSON-RPC Handler
-# -------------------------------------------------------
+# ============================================================
+# MCP JSON-RPC HANDLER
+# ============================================================
 async def handle_mcp(message: dict):
     method = message.get("method")
     msg_id = message.get("id")
 
-    # 1️⃣ Initialize
+    log.info("MCP Method: %s", method)
+
+    if not method:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32600, "message": "Invalid Request"}
+        }
+
+    # --------------------------------------------------------
+    # INITIALIZE
+    # --------------------------------------------------------
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -132,22 +142,26 @@ async def handle_mcp(message: dict):
                 },
                 "serverInfo": {
                     "name": "Pega2Gemini",
-                    "version": "1.0.0"
-                },
-            },
+                    "version": "2.0.0"
+                }
+            }
         }
 
-    # 2️⃣ Tools List
+    # --------------------------------------------------------
+    # TOOLS LIST
+    # --------------------------------------------------------
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "tools": TOOLS
-            },
+            }
         }
 
-    # 3️⃣ Tool Call
+    # --------------------------------------------------------
+    # TOOL CALL
+    # --------------------------------------------------------
     if method == "tools/call":
         params = message.get("params", {})
         tool_name = params.get("name")
@@ -160,52 +174,61 @@ async def handle_mcp(message: dict):
             "id": msg_id,
             "result": {
                 "content": [
-                    {
-                        "type": "text",
-                        "text": result_text,
-                    }
+                    {"type": "text", "text": result_text}
                 ],
-                "isError": False,
-            },
+                "isError": False
+            }
         }
 
-    # Default empty response
     return {
         "jsonrpc": "2.0",
         "id": msg_id,
-        "result": {},
+        "error": {"code": -32601, "message": "Method not found"}
     }
 
-# -------------------------------------------------------
-# HTTP MCP Endpoint (Cloud Run Safe)
-# -------------------------------------------------------
+# ============================================================
+# GET HANDSHAKE (Fixes 405 error)
+# ============================================================
+@app.get("/mcp")
+async def mcp_get():
+    log.info("GET /mcp handshake")
+    return JSONResponse({
+        "status": "MCP endpoint ready",
+        "version": "2.0.0"
+    })
+
+# ============================================================
+# POST MCP
+# ============================================================
 @app.post("/mcp")
-async def mcp_endpoint(request: Request):
+async def mcp_post(request: Request):
     try:
         body = await request.json()
-        log.info("MCP Request: %s", body)
+        log.info("MCP Request Body: %s", body)
 
         response = await handle_mcp(body)
-
         return JSONResponse(response)
 
     except Exception as e:
-        log.exception("MCP processing failed")
+        log.error("Unhandled MCP error")
+        log.error(traceback.format_exc())
+
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
                 "id": None,
                 "error": {
                     "code": -32000,
-                    "message": str(e),
-                },
+                    "message": str(e)
+                }
             },
-            status_code=500,
+            status_code=500
         )
 
-# -------------------------------------------------------
-# Health Check
-# -------------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "Pega2Gemini HTTP MCP version"}
+    return {"status": "ok", "service": "Pega2Gemini HTTP MCP v2"}
+
