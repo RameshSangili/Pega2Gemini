@@ -1,83 +1,79 @@
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import os
 import time
 import uuid
-import traceback
+from typing import Dict
+
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # ============================================================
-# LOGGING (Detailed)
+# LOGGING CONFIGURATION
 # ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("pega2gemini")
 
-app = FastAPI(title="Pega2Gemini-HTTP", version="2.0.0")
+log = logging.getLogger("MCP")
 
 # ============================================================
-# ENVIRONMENT
+# APP INIT
 # ============================================================
+
+app = FastAPI(title="Pega MCP Multi-Agent Router", version="3.0.0")
+
+PORT = int(os.environ.get("PORT", 8080))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = "models/gemini-1.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/{GEMINI_MODEL}:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
+# Session storage
+_sessions: Dict[str, asyncio.Queue] = {}
 
 # ============================================================
-# MCP TOOLS
+# TOOL DEFINITIONS
 # ============================================================
+
 TOOLS = [
     {
-        "name": "eligibility_check",
-        "description": "Check loan eligibility based on applicant profile.",
+        "name": "loan_analysis",
+        "description": "Analyze loan eligibility and provide recommendation.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "income": {"type": "number"},
                 "credit_score": {"type": "integer"},
-                "employment": {"type": "string"},
                 "loan_amount": {"type": "number"},
             },
             "required": ["income", "credit_score", "loan_amount"],
         },
     },
     {
-        "name": "loan_recommendation",
-        "description": "Recommend the best loan product.",
+        "name": "risk_evaluation",
+        "description": "Evaluate financial risk and provide compliance guidance.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "purpose": {"type": "string"},
-                "amount": {"type": "number"},
-                "credit_score": {"type": "integer"},
+                "profile": {"type": "string"},
             },
-            "required": ["purpose", "amount", "credit_score"],
+            "required": ["profile"],
         },
     },
-    {
-        "name": "credit_summary",
-        "description": "Summarise credit profile and risk factors.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "credit_score": {"type": "integer"},
-            },
-            "required": ["credit_score"],
-        },
-    }
 ]
 
 # ============================================================
-# GEMINI CALL
+# ROUTING ENGINE
 # ============================================================
+
 async def call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
-        return "ERROR: GEMINI_API_KEY not set."
+        return "GEMINI_API_KEY not configured."
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -85,150 +81,138 @@ async def call_gemini(prompt: str) -> str:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                json=payload
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         log.error("Gemini error: %s", e)
-        return f"Gemini error: {str(e)}"
+        return f"Gemini error: {e}"
 
-# ============================================================
-# TOOL DISPATCHER
-# ============================================================
-async def dispatch_tool(tool_name: str, arguments: dict) -> str:
-    log.info("Dispatching tool: %s | Args: %s", tool_name, arguments)
 
-    prompt = (
-        "You are an expert loan officer.\n"
-        f"Tool: {tool_name}\n"
-        f"Input: {json.dumps(arguments)}\n"
-        "Provide professional output."
-    )
+async def route_tool(name: str, args: dict) -> str:
+    log.info("Routing tool: %s", name)
 
-    return await call_gemini(prompt)
+    if name == "loan_analysis":
+        return await call_gemini(
+            f"Analyze this loan application: {json.dumps(args)}"
+        )
+
+    if name == "risk_evaluation":
+        return await call_gemini(
+            f"Evaluate financial risk profile: {json.dumps(args)}"
+        )
+
+    return "Unknown tool."
 
 # ============================================================
 # MCP JSON-RPC HANDLER
 # ============================================================
-async def handle_mcp(message: dict):
+
+async def build_response(message: dict):
     method = message.get("method")
     msg_id = message.get("id")
 
     log.info("MCP Method: %s", method)
 
-    if not method:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {"code": -32600, "message": "Invalid Request"}
-        }
-
-    # --------------------------------------------------------
-    # INITIALIZE
-    # --------------------------------------------------------
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "protocolVersion": "2025-03-26",
-                "capabilities": {
-                    "tools": {"listChanged": False}
-                },
+                "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
-                    "name": "Pega2Gemini",
-                    "version": "2.0.0"
-                }
-            }
+                    "name": "PegaMCPRouter",
+                    "version": "3.0.0",
+                },
+            },
         }
 
-    # --------------------------------------------------------
-    # TOOLS LIST
-    # --------------------------------------------------------
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {
-                "tools": TOOLS
-            }
+            "result": {"tools": TOOLS},
         }
 
-    # --------------------------------------------------------
-    # TOOL CALL
-    # --------------------------------------------------------
     if method == "tools/call":
         params = message.get("params", {})
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-
-        result_text = await dispatch_tool(tool_name, arguments)
+        result_text = await route_tool(
+            params.get("name"), params.get("arguments", {})
+        )
 
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "content": [
-                    {"type": "text", "text": result_text}
-                ],
-                "isError": False
-            }
+                "content": [{"type": "text", "text": result_text}],
+                "isError": False,
+            },
         }
 
-    return {
-        "jsonrpc": "2.0",
-        "id": msg_id,
-        "error": {"code": -32601, "message": "Method not found"}
-    }
+    return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
 # ============================================================
-# GET HANDSHAKE (Fixes 405 error)
+# SSE ENDPOINT (PEGA REQUIRED)
 # ============================================================
+
 @app.get("/mcp")
-async def mcp_get():
-    log.info("GET /mcp handshake")
-    return JSONResponse({
-        "status": "MCP endpoint ready",
-        "version": "2.0.0"
-    })
+async def mcp_sse(request: Request):
+    session_id = str(uuid.uuid4())
+    queue = asyncio.Queue()
+    _sessions[session_id] = queue
+
+    log.info("SSE START session=%s", session_id)
+
+    async def event_stream():
+        try:
+            # REQUIRED FIRST EVENT
+            yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    log.info("Client disconnected session=%s", session_id)
+                    break
+
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=20)
+                    yield f"event: message\ndata: {json.dumps(msg)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+
+        finally:
+            _sessions.pop(session_id, None)
+            log.info("SSE END session=%s", session_id)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 # ============================================================
-# POST MCP
+# MESSAGE HANDLER
 # ============================================================
-@app.post("/mcp")
-async def mcp_post(request: Request):
-    try:
-        body = await request.json()
-        log.info("MCP Request Body: %s", body)
 
-        response = await handle_mcp(body)
-        return JSONResponse(response)
+@app.post("/mcp/messages")
+async def mcp_message(request: Request, session_id: str):
+    body = await request.json()
+    log.info("MCP Request Body: %s", body)
 
-    except Exception as e:
-        log.error("Unhandled MCP error")
-        log.error(traceback.format_exc())
+    queue = _sessions.get(session_id)
+    if not queue:
+        log.error("Invalid session_id=%s", session_id)
+        return JSONResponse({"error": "Invalid session"}, status_code=404)
 
-        return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                }
-            },
-            status_code=500
-        )
+    response = await build_response(body)
+    await queue.put(response)
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-@app.get("/")
-async def health():
-    return {"status": "ok", "service": "Pega2Gemini HTTP MCP v4"}
-
+    return JSONResponse({"status": "accepted"})
