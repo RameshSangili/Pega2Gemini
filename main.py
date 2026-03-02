@@ -151,8 +151,7 @@ async def build_response(message: dict) -> dict | None:
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "content": [{"type": "text", "text": result_text}],
-                "isError": False,
+                "content": [{"type": "text", "text": result_text}]
             },
         }
 
