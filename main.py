@@ -146,7 +146,7 @@ async def build_response(message: dict) -> dict | None:
         tool_name = (params.get("name") or "").strip()
         args = params.get("arguments") or {}
         result_text = await route_tool(tool_name, args)
-
+        log.info("tools response  %s ", result_text)        
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
