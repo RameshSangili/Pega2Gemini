@@ -31,7 +31,7 @@ app = FastAPI(title="Pega MCP Multi-Agent Router", version="3.0.0")
 
 PORT = int(os.environ.get("PORT", 8080))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 # Session storage
 _sessions: Dict[str, asyncio.Queue] = {}
