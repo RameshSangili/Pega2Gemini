@@ -31,6 +31,8 @@ PORT = int(os.environ.get("PORT", 8080)) # Cloud Run sets PORT=8080 normally
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "").strip()
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 
 PING_SECONDS = int(os.environ.get("PING_SECONDS", "20")) # keepalive for SSE
 
@@ -68,13 +70,50 @@ TOOLS = [
 # ============================================================
 # ROUTING ENGINE
 # ============================================================
+
+async def call_claude(prompt: str) -> str:
+    if not CLAUDE_API_KEY:
+        return "CLAUDE_API_KEY not configured."
+
+    payload = {
+        "model": "claude-3-haiku-20240307",
+        "max_tokens": 500,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(CLAUDE_URL, headers=headers, json=payload)
+
+            if resp.status_code >= 400:
+                log.error("Claude HTTP %s response=%s", resp.status_code, resp.text[:800])
+                return f"Claude error HTTP {resp.status_code}: {resp.text[:200]}"
+
+            data = resp.json()
+            return data["content"][0]["text"]
+
+    except Exception as e:
+        log.exception("Claude exception")
+        return f"Claude exception: {e}"
+
+
+
+
 async def call_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
         return "GEMINI_API_KEY not configured."
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 512},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1024},
     }
 
     try:
@@ -100,7 +139,7 @@ async def route_tool(name: str, args: dict) -> str:
         return await call_gemini(f"Analyze this loan application: {json.dumps(args)}")
 
     if name == "risk_evaluation":
-        return await call_gemini(f"Evaluate financial risk profile: {json.dumps(args)}")
+        return await call_claude(f"Evaluate financial risk profile: {json.dumps(args)}")
 
     return "Unknown tool."
 
